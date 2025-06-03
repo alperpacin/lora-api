@@ -175,8 +175,8 @@ if not model_path or not bucket_name or not folder or not lora_name or not regio
     print('ERROR: Missing required environment variables for S3 upload', file=sys.stderr)
     sys.exit(1)
 
-# Construct the S3 key: loras/<folder>/<lora_name>.safetensors
-key = f'loras/{folder}/{lora_name}.safetensors'
+# Construct the S3 key: loras/{{folder}}/{{lora_name}}.safetensors
+key = f'loras/{{folder}}/{{lora_name}}.safetensors'
 
 # Boto3 will auto‐pick up Cognito‐issued temp credentials in the environment
 s3 = boto3.client('s3', region_name=region)
@@ -281,7 +281,7 @@ if not model_path or not bucket_name or not folder or not lora_name or not regio
     print("ERROR: Missing required environment variables for S3 upload", file=sys.stderr)
     sys.exit(1)
 
-# Construct the S3 key: loras/<folder>/<lora_name>.safetensors
+# Construct the S3 key: loras/{{folder}}/{{lora_name}}.safetensors
 key = f"loras/{{folder}}/{{lora_name}}.safetensors"
 
 # Boto3 will auto‐pick up Cognito‐issued temp credentials in the environment
