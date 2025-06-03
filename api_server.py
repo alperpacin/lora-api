@@ -7,6 +7,7 @@ import zipfile
 import tempfile
 import requests
 import subprocess
+import platform
 
 import boto3
 from botocore.exceptions import BotoCoreError, ClientError
@@ -16,6 +17,9 @@ from pydantic import BaseModel, HttpUrl
 from typing import Optional
 
 app = FastAPI()
+
+# Detect operating system
+IS_WINDOWS = platform.system() == "Windows"
 
 # ─────────────────────────────────────────────────────────────────────────────
 # 1. Request schema including:
@@ -94,45 +98,122 @@ def download_and_extract_zip(zip_url: str, target_folder: str):
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# 4. POST /train_lora
-@app.post("/train_lora")
-async def train_lora(req: LoRATrainRequest):
-    # 4.a. Validate folder_name
-    if "/" in req.folder_name or "\\" in req.folder_name:
-        raise HTTPException(status_code=400, detail="folder_name must not contain path separators")
+# 4. Generate platform-specific scripts
+def generate_training_script(job_dir, dst_train_sh, extracted_folder, req):
+    """Generate appropriate training script based on platform"""
+    if IS_WINDOWS:
+        # Windows batch script
+        script_path = os.path.join(job_dir, "run_lora.bat")
+        venv_activate = os.path.abspath(os.path.join("venv", "Scripts", "activate.bat"))
+        
+        script_content = f"""@echo off
+REM ─────────────────────────────────────────────────────────────────────────────
+REM 1. Activate the Python venv
+call "{venv_activate}"
+cd /d "{job_dir}"
 
-    # 4.b. Download & extract ZIP
-    extracted_folder = os.path.join(TRAIN_BASE, req.folder_name)
-    try:
-        download_and_extract_zip(req.image_zip_url, extracted_folder)
-    except HTTPException as he:
-        raise he
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=f"Unexpected ZIP error: {e}")
+REM ─────────────────────────────────────────────────────────────────────────────
+REM 2. Set hyperparameters & environment variables
+set PRETRAINED_MODEL={req.pretrained_model}
+set TRAIN_DATA_DIR={extracted_folder}
+set OUTPUT_DIR={job_dir}\\output
+set LR={req.learning_rate}
+set MAX_TRAIN_STEPS={req.max_train_steps}
+set RESOLUTION={req.resolution}
+set TRAIN_BATCH_SIZE={req.train_batch_size}
+set NETWORK_ALPHA={req.network_alpha}
+set MIXED_PRECISION={req.mixed_precision}
 
-    # 4.c. Ensure folder is not empty
-    if not os.path.isdir(extracted_folder) or len(os.listdir(extracted_folder)) == 0:
-        raise HTTPException(status_code=400, detail="ZIP extracted but found no files")
+REM Info for S3 upload
+set FOLDER_NAME={req.folder_name}
+set LORA_NAME={req.lora_name}
 
-    # 4.d. Create job directory
-    job_id = str(uuid.uuid4())
-    job_dir = os.path.join(JOBS_ROOT, job_id)
-    os.makedirs(job_dir, exist_ok=True)
+REM ─────────────────────────────────────────────────────────────────────────────
+REM 3. Run LoRA training
+python "{dst_train_sh}" ^
+  --pretrained_model_name_or_path=%PRETRAINED_MODEL% ^
+  --train_data_dir=%TRAIN_DATA_DIR% ^
+  --output_dir=%OUTPUT_DIR% ^
+  --network_module=lora ^
+  --learning_rate=%LR% ^
+  --max_train_steps=%MAX_TRAIN_STEPS% ^
+  --resolution=%RESOLUTION% ^
+  --train_batch_size=%TRAIN_BATCH_SIZE% ^
+  --network_alpha=%NETWORK_ALPHA% ^
+  --mixed_precision=%MIXED_PRECISION%
 
-    # 4.e. Copy train.sh
-    src_train_sh = os.path.abspath("train.sh")
-    dst_train_sh = os.path.join(job_dir, "train.sh")
-    try:
-        shutil.copyfile(src_train_sh, dst_train_sh)
-        os.chmod(dst_train_sh, 0o755)
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=f"Failed to stage train.sh: {e}")
+REM ─────────────────────────────────────────────────────────────────────────────
+REM 4. Locate the .safetensors file
+for /f "tokens=*" %%a in ('dir /b "%OUTPUT_DIR%\\*.safetensors" 2^>nul') do (
+  set MODEL_FILE=%OUTPUT_DIR%\\%%a
+  goto MODEL_FOUND
+)
 
-    # 4.f. Build run_lora.sh
-    run_script = f"""#!/usr/bin/env bash
+echo ERROR: No .safetensors found in %OUTPUT_DIR%
+exit /b 1
+
+:MODEL_FOUND
+echo Found model at: %MODEL_FILE%
+
+REM ─────────────────────────────────────────────────────────────────────────────
+REM 5. Upload using Boto3 (Python snippet)
+set MODEL_PATH=%MODEL_FILE%
+
+python -c "
+import os
+import sys
+import boto3
+from botocore.exceptions import BotoCoreError, ClientError
+
+model_path = os.getenv('MODEL_PATH')
+bucket_name = os.getenv('S3_BUCKET_NAME')
+folder = os.getenv('FOLDER_NAME')
+lora_name = os.getenv('LORA_NAME')
+region = os.getenv('AWS_DEFAULT_REGION')
+
+if not model_path or not bucket_name or not folder or not lora_name or not region:
+    print('ERROR: Missing required environment variables for S3 upload', file=sys.stderr)
+    sys.exit(1)
+
+# Construct the S3 key: loras/<folder>/<lora_name>.safetensors
+key = f'loras/{folder}/{lora_name}.safetensors'
+
+# Boto3 will auto‐pick up Cognito‐issued temp credentials in the environment
+s3 = boto3.client('s3', region_name=region)
+
+try:
+    print(f'Uploading {{model_path}} to s3://{{bucket_name}}/{{key}} …')
+    s3.upload_file(model_path, bucket_name, key)
+    print('Upload successful')
+except (BotoCoreError, ClientError) as e:
+    print(f'ERROR: Boto3 upload failed: {{e}}', file=sys.stderr)
+    sys.exit(1)
+"
+
+if %errorlevel% neq 0 (
+  echo ERROR: Python‐based S3 upload failed
+  exit /b 1
+)
+
+echo S3 upload done: s3://%S3_BUCKET_NAME%/loras/%FOLDER_NAME%/%LORA_NAME%.safetensors
+
+REM Optionally, remove local copy:
+REM del "%MODEL_FILE%"
+
+exit /b 0
+"""
+        # For Windows, we assume train.sh is actually a Python script we'll call
+        script_file_ext = ".bat"
+        
+    else:
+        # Unix/Linux bash script
+        script_path = os.path.join(job_dir, "run_lora.sh")
+        venv_activate = os.path.abspath("venv/bin/activate")
+        
+        script_content = f"""#!/usr/bin/env bash
 # ─────────────────────────────────────────────────────────────────────────────
 # 1. Activate the Python venv
-source "{os.path.abspath('venv/bin/activate')}"
+source "{venv_activate}"
 cd "{job_dir}"
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -200,7 +281,7 @@ if not model_path or not bucket_name or not folder or not lora_name or not regio
     print("ERROR: Missing required environment variables for S3 upload", file=sys.stderr)
     sys.exit(1)
 
-# Construct the S3 key: loras/{{folder}}/{{lora_name}}.safetensors
+# Construct the S3 key: loras/<folder>/<lora_name>.safetensors
 key = f"loras/{{folder}}/{{lora_name}}.safetensors"
 
 # Boto3 will auto‐pick up Cognito‐issued temp credentials in the environment
@@ -227,26 +308,87 @@ echo "S3 upload done: s3://$S3_BUCKET_NAME/loras/$FOLDER_NAME/$LORA_NAME.safeten
 
 exit 0
 """
-
-    # 4.g. Write run_lora.sh and chmod
-    run_path = os.path.join(job_dir, "run_lora.sh")
+        script_file_ext = ".sh"
+    
+    # Write the script
     try:
-        with open(run_path, "w") as f:
-            f.write(run_script)
-        os.chmod(run_path, 0o755)
+        with open(script_path, "w") as f:
+            f.write(script_content)
+        
+        # Set execute permissions on Unix systems
+        if not IS_WINDOWS:
+            os.chmod(script_path, 0o755)
     except Exception as e:
-        raise HTTPException(status_code=500, detail=f"Failed to write run_lora.sh: {e}")
+        raise HTTPException(status_code=500, detail=f"Failed to write script: {e}")
+    
+    return script_path
 
-    # 4.h. Launch training in background, log to training.log
+# ─────────────────────────────────────────────────────────────────────────────
+# 5. POST /train_lora
+@app.post("/train_lora")
+async def train_lora(req: LoRATrainRequest):
+    # 5.a. Validate folder_name
+    if "/" in req.folder_name or "\\" in req.folder_name:
+        raise HTTPException(status_code=400, detail="folder_name must not contain path separators")
+
+    # 5.b. Download & extract ZIP
+    extracted_folder = os.path.join(TRAIN_BASE, req.folder_name)
+    try:
+        download_and_extract_zip(req.image_zip_url, extracted_folder)
+    except HTTPException as he:
+        raise he
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Unexpected ZIP error: {e}")
+
+    # 5.c. Ensure folder is not empty
+    if not os.path.isdir(extracted_folder) or len(os.listdir(extracted_folder)) == 0:
+        raise HTTPException(status_code=400, detail="ZIP extracted but found no files")
+
+    # 5.d. Create job directory
+    job_id = str(uuid.uuid4())
+    job_dir = os.path.join(JOBS_ROOT, job_id)
+    os.makedirs(job_dir, exist_ok=True)
+    
+    # Create output directory
+    output_dir = os.path.join(job_dir, "output")
+    os.makedirs(output_dir, exist_ok=True)
+
+    # 5.e. Copy train.sh
+    src_train_sh = os.path.abspath("train.sh")
+    dst_train_sh = os.path.join(job_dir, "train.sh")
+    try:
+        shutil.copyfile(src_train_sh, dst_train_sh)
+        # Set execute permissions on Unix systems
+        if not IS_WINDOWS:
+            os.chmod(dst_train_sh, 0o755)
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Failed to stage train.sh: {e}")
+
+    # 5.f. Generate platform-specific script
+    run_script_path = generate_training_script(job_dir, dst_train_sh, extracted_folder, req)
+
+    # 5.g. Launch training in background, log to training.log
     log_file_path = os.path.join(job_dir, "training.log")
     try:
         log_file = open(log_file_path, "w")
-        subprocess.Popen(
-            ["/usr/bin/env", "bash", run_path],
-            cwd=job_dir,
-            stdout=log_file,
-            stderr=subprocess.STDOUT,
-        )
+        
+        if IS_WINDOWS:
+            # On Windows, use different approach to run batch file
+            subprocess.Popen(
+                ["cmd", "/c", run_script_path],
+                cwd=job_dir,
+                stdout=log_file,
+                stderr=subprocess.STDOUT,
+                shell=True
+            )
+        else:
+            # On Unix/Linux
+            subprocess.Popen(
+                ["/usr/bin/env", "bash", run_script_path],
+                cwd=job_dir,
+                stdout=log_file,
+                stderr=subprocess.STDOUT,
+            )
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Failed to start subprocess: {e}")
 
@@ -260,7 +402,7 @@ exit 0
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# 5. GET /job_status/{job_id}
+# 6. GET /job_status/{job_id}
 @app.get("/job_status/{job_id}")
 async def job_status(job_id: str):
     # Basic validation
@@ -323,7 +465,7 @@ async def job_status(job_id: str):
         status = "uploaded"
     elif has_error:
         status = "failed"
-    elif os.path.exists(os.path.join(job_dir, "run_lora.sh")):
+    elif os.path.exists(os.path.join(job_dir, "run_lora.sh")) or os.path.exists(os.path.join(job_dir, "run_lora.bat")):
         status = "training"
     else:
         status = "unknown"
