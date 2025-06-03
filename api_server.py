@@ -98,13 +98,96 @@ def download_and_extract_zip(zip_url: str, target_folder: str):
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# 4. Generate platform-specific scripts
+# 4. Helper: Create Windows-compatible training script
+def create_windows_training_script(job_dir, extracted_folder, req):
+    """
+    For Windows, create a direct Python script to handle training
+    instead of trying to run the bash script
+    """
+    train_py_path = os.path.join(job_dir, "train_lora.py")
+    
+    # Create a Python training script for Windows
+    train_py_content = f"""
+import os
+import sys
+import subprocess
+import accelerate.commands.launch
+
+# Set up training parameters
+os.environ["HF_HOME"] = "huggingface"
+os.environ["PYTHONPATH"] = os.getcwd()
+
+# Parameters from the request
+pretrained_model = "{req.pretrained_model}"
+train_data_dir = r"{extracted_folder}"
+output_dir = r"{job_dir}\\output"
+learning_rate = {req.learning_rate}
+max_train_steps = {req.max_train_steps}
+resolution = "{req.resolution}"
+train_batch_size = {req.train_batch_size}
+network_alpha = {req.network_alpha}
+mixed_precision = "{req.mixed_precision}"
+
+# Build command-line arguments
+args = [
+    "--pretrained_model_name_or_path", pretrained_model,
+    "--train_data_dir", train_data_dir,
+    "--output_dir", output_dir,
+    "--network_module", "lora",
+    "--learning_rate", str(learning_rate),
+    "--max_train_steps", str(max_train_steps),
+    "--resolution", resolution,
+    "--train_batch_size", str(train_batch_size),
+    "--network_alpha", str(network_alpha),
+    "--mixed_precision", mixed_precision
+]
+
+# This function will be called to run the actual training
+def main():
+    try:
+        # Import and run the accelerate launch command
+        from accelerate.commands.launch import main as accelerate_main
+        from accelerate.commands.config import main as accelerate_config
+        
+        # Configure accelerate if not already configured
+        try:
+            accelerate_config(["default", "--mixed_precision=fp16"])
+        except:
+            pass
+            
+        # Add the main training script and its arguments to sys.argv
+        sys.argv = ["accelerate", "launch", "-m", "train_network", "--network_module=lora"] + args
+        accelerate_main()
+        
+        return 0
+    except Exception as e:
+        print(f"Training failed: {{e}}")
+        return 1
+
+if __name__ == "__main__":
+    sys.exit(main())
+"""
+    
+    try:
+        with open(train_py_path, "w", encoding="utf-8") as f:
+            f.write(train_py_content)
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Failed to create Windows training script: {e}")
+    
+    return train_py_path
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# 5. Generate platform-specific scripts
 def generate_training_script(job_dir, dst_train_sh, extracted_folder, req):
     """Generate appropriate training script based on platform"""
     if IS_WINDOWS:
         # Windows batch script
         script_path = os.path.join(job_dir, "run_lora.bat")
         venv_activate = os.path.abspath(os.path.join("venv", "Scripts", "activate.bat"))
+        
+        # For Windows, create a Python script to handle the training
+        train_py_path = create_windows_training_script(job_dir, extracted_folder, req)
         
         script_content = f"""@echo off
 REM -----------------------------------------------------------------------------
@@ -113,34 +196,20 @@ call "{venv_activate}"
 cd /d "{job_dir}"
 
 REM -----------------------------------------------------------------------------
-REM 2. Set hyperparameters & environment variables
+REM 2. Set environment variables
 set PRETRAINED_MODEL={req.pretrained_model}
 set TRAIN_DATA_DIR={extracted_folder}
 set OUTPUT_DIR={job_dir}\\output
-set LR={req.learning_rate}
-set MAX_TRAIN_STEPS={req.max_train_steps}
-set RESOLUTION={req.resolution}
-set TRAIN_BATCH_SIZE={req.train_batch_size}
-set NETWORK_ALPHA={req.network_alpha}
-set MIXED_PRECISION={req.mixed_precision}
-
-REM Info for S3 upload
 set FOLDER_NAME={req.folder_name}
 set LORA_NAME={req.lora_name}
 
 REM -----------------------------------------------------------------------------
-REM 3. Run LoRA training
-python "{dst_train_sh}" ^
-  --pretrained_model_name_or_path=%PRETRAINED_MODEL% ^
-  --train_data_dir=%TRAIN_DATA_DIR% ^
-  --output_dir=%OUTPUT_DIR% ^
-  --network_module=lora ^
-  --learning_rate=%LR% ^
-  --max_train_steps=%MAX_TRAIN_STEPS% ^
-  --resolution=%RESOLUTION% ^
-  --train_batch_size=%TRAIN_BATCH_SIZE% ^
-  --network_alpha=%NETWORK_ALPHA% ^
-  --mixed_precision=%MIXED_PRECISION%
+REM 3. Run LoRA training using Python script
+python "{train_py_path}"
+if %errorlevel% neq 0 (
+  echo ERROR: Training failed
+  exit /b 1
+)
 
 REM -----------------------------------------------------------------------------
 REM 4. Locate the .safetensors file
@@ -197,12 +266,8 @@ if %errorlevel% neq 0 (
 
 echo S3 upload done: s3://%S3_BUCKET_NAME%/loras/%FOLDER_NAME%/%LORA_NAME%.safetensors
 
-REM Optionally, remove local copy:
-REM del "%MODEL_FILE%"
-
 exit /b 0
 """
-        # For Windows, we assume train.sh is actually a Python script we'll call
         script_file_ext = ".bat"
         
         # Use utf-8 encoding specifically for Windows
