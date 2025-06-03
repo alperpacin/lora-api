@@ -107,12 +107,12 @@ def generate_training_script(job_dir, dst_train_sh, extracted_folder, req):
         venv_activate = os.path.abspath(os.path.join("venv", "Scripts", "activate.bat"))
         
         script_content = f"""@echo off
-REM ─────────────────────────────────────────────────────────────────────────────
+REM -----------------------------------------------------------------------------
 REM 1. Activate the Python venv
 call "{venv_activate}"
 cd /d "{job_dir}"
 
-REM ─────────────────────────────────────────────────────────────────────────────
+REM -----------------------------------------------------------------------------
 REM 2. Set hyperparameters & environment variables
 set PRETRAINED_MODEL={req.pretrained_model}
 set TRAIN_DATA_DIR={extracted_folder}
@@ -128,7 +128,7 @@ REM Info for S3 upload
 set FOLDER_NAME={req.folder_name}
 set LORA_NAME={req.lora_name}
 
-REM ─────────────────────────────────────────────────────────────────────────────
+REM -----------------------------------------------------------------------------
 REM 3. Run LoRA training
 python "{dst_train_sh}" ^
   --pretrained_model_name_or_path=%PRETRAINED_MODEL% ^
@@ -142,7 +142,7 @@ python "{dst_train_sh}" ^
   --network_alpha=%NETWORK_ALPHA% ^
   --mixed_precision=%MIXED_PRECISION%
 
-REM ─────────────────────────────────────────────────────────────────────────────
+REM -----------------------------------------------------------------------------
 REM 4. Locate the .safetensors file
 for /f "tokens=*" %%a in ('dir /b "%OUTPUT_DIR%\\*.safetensors" 2^>nul') do (
   set MODEL_FILE=%OUTPUT_DIR%\\%%a
@@ -155,7 +155,7 @@ exit /b 1
 :MODEL_FOUND
 echo Found model at: %MODEL_FILE%
 
-REM ─────────────────────────────────────────────────────────────────────────────
+REM -----------------------------------------------------------------------------
 REM 5. Upload using Boto3 (Python snippet)
 set MODEL_PATH=%MODEL_FILE%
 
@@ -178,11 +178,11 @@ if not model_path or not bucket_name or not folder or not lora_name or not regio
 # Construct the S3 key: loras/{{folder}}/{{lora_name}}.safetensors
 key = f'loras/{{folder}}/{{lora_name}}.safetensors'
 
-# Boto3 will auto‐pick up Cognito‐issued temp credentials in the environment
+# Boto3 will auto-pick up Cognito-issued temp credentials in the environment
 s3 = boto3.client('s3', region_name=region)
 
 try:
-    print(f'Uploading {{model_path}} to s3://{{bucket_name}}/{{key}} …')
+    print(f'Uploading {{model_path}} to s3://{{bucket_name}}/{{key}} ...')
     s3.upload_file(model_path, bucket_name, key)
     print('Upload successful')
 except (BotoCoreError, ClientError) as e:
@@ -191,7 +191,7 @@ except (BotoCoreError, ClientError) as e:
 "
 
 if %errorlevel% neq 0 (
-  echo ERROR: Python‐based S3 upload failed
+  echo ERROR: Python-based S3 upload failed
   exit /b 1
 )
 
@@ -205,6 +205,19 @@ exit /b 0
         # For Windows, we assume train.sh is actually a Python script we'll call
         script_file_ext = ".bat"
         
+        # Use utf-8 encoding specifically for Windows
+        try:
+            with open(script_path, "w", encoding="utf-8") as f:
+                f.write(script_content)
+        except Exception as e:
+            # Fallback to ASCII if utf-8 fails
+            try:
+                # Replace any potential non-ASCII characters
+                ascii_content = script_content.encode('ascii', 'replace').decode('ascii')
+                with open(script_path, "w", encoding="ascii") as f:
+                    f.write(ascii_content)
+            except Exception as inner_e:
+                raise HTTPException(status_code=500, detail=f"Failed to write script: {e}. Fallback also failed: {inner_e}")
     else:
         # Unix/Linux bash script
         script_path = os.path.join(job_dir, "run_lora.sh")
