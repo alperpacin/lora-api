@@ -39,8 +39,9 @@ class LoRATrainRequest(BaseModel):
 
 # ─────────────────────────────────────────────────────────────────────────────
 # 2. Directory constants
-TRAIN_BASE = "/mnt/data/train_images"
-JOBS_ROOT = "/mnt/data/lora_jobs"
+USER_HOME = os.path.expanduser("~")
+TRAIN_BASE = os.path.join(USER_HOME, "lora_data/train_images")
+JOBS_ROOT = os.path.join(USER_HOME, "lora_data/lora_jobs")
 
 os.makedirs(TRAIN_BASE, exist_ok=True)
 os.makedirs(JOBS_ROOT, exist_ok=True)
@@ -183,7 +184,7 @@ echo "Found model at: $MODEL_FILE"
 # 5. Upload using Boto3 (Python snippet)
 export MODEL_PATH="$MODEL_FILE"
 
-python3 - << 'EOF'
+python3 - << EOF
 import os
 import sys
 import boto3
@@ -199,8 +200,8 @@ if not model_path or not bucket_name or not folder or not lora_name or not regio
     print("ERROR: Missing required environment variables for S3 upload", file=sys.stderr)
     sys.exit(1)
 
-# Construct the S3 key: loras/<folder>/<lora_name>.safetensors
-key = f"loras/{folder}/{lora_name}.safetensors"
+# Construct the S3 key: loras/{{folder}}/{{lora_name}}.safetensors
+key = f"loras/{{folder}}/{{lora_name}}.safetensors"
 
 # Boto3 will auto‐pick up Cognito‐issued temp credentials in the environment
 s3 = boto3.client("s3", region_name=region)
@@ -249,28 +250,88 @@ exit 0
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Failed to start subprocess: {e}")
 
-    return {"job_id": job_id, "status": "started"}
+    return {
+        "status": "training_started",
+        "job_id": job_id,
+        "folder": req.folder_name,
+        "lora_name": req.lora_name,
+        "log_file": log_file_path,
+    }
 
 
 # ─────────────────────────────────────────────────────────────────────────────
 # 5. GET /job_status/{job_id}
 @app.get("/job_status/{job_id}")
 async def job_status(job_id: str):
+    # Basic validation
+    if not job_id or not all(c.isalnum() or c == "-" for c in job_id):
+        raise HTTPException(
+            status_code=400,
+            detail="Invalid job ID format (must be alphanumeric + hyphens only)",
+        )
+
+    # Check job exists
     job_dir = os.path.join(JOBS_ROOT, job_id)
     if not os.path.isdir(job_dir):
         raise HTTPException(status_code=404, detail="Job not found")
 
-    output_dir = os.path.join(job_dir, "output")
-    completed = (os.path.isdir(output_dir) and len(os.listdir(output_dir)) > 0)
-
+    # Get log file
     log_file_path = os.path.join(job_dir, "training.log")
-    try:
-        log_contents = open(log_file_path, "r").read()
-    except FileNotFoundError:
-        log_contents = ""
+    log_content = ""
+    if os.path.exists(log_file_path):
+        try:
+            with open(log_file_path, "r") as f:
+                log_content = f.read()
+        except Exception as e:
+            return {
+                "status": "error",
+                "message": f"Failed to read log file: {e}",
+            }
+
+    # Check for output directory and safetensors file
+    output_dir = os.path.join(job_dir, "output")
+    has_output_dir = os.path.isdir(output_dir)
+
+    # Look for any .safetensors files
+    lora_files = []
+    if has_output_dir:
+        lora_files = [
+            f for f in os.listdir(output_dir) if f.endswith(".safetensors")
+        ]
+
+    # Error detection patterns
+    error_patterns = [
+        "Error while finding module specification",
+        "ModuleNotFoundError",
+        "No module named",
+        "ImportError",
+        "ERROR:",
+        "Exception in",
+        "Traceback (most recent call last)",
+        "Failed to",
+        "Could not",
+        "Cannot",
+    ]
+    
+    # Check if any error pattern exists in the log
+    has_error = any(pattern in log_content for pattern in error_patterns)
+
+    # Determine status based on the artifacts we found and logs
+    if lora_files:
+        status = "completed"
+    elif "Upload successful" in log_content:
+        status = "uploaded"
+    elif has_error:
+        status = "failed"
+    elif os.path.exists(os.path.join(job_dir, "run_lora.sh")):
+        status = "training"
+    else:
+        status = "unknown"
 
     return {
         "job_id": job_id,
-        "completed": completed,
-        "log": log_contents,
+        "status": status,
+        "has_output_dir": has_output_dir,
+        "lora_files": lora_files,
+        "log": log_content[-4000:] if log_content else "",  # Last 4K of log
     }
