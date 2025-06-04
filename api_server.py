@@ -286,6 +286,7 @@ def generate_training_script(job_dir, extracted_folder, req, use_safe_training=T
     """Generate appropriate training script based on platform with additional safety measures"""
     # Use force_gpu parameter to determine if we should skip CPU fallback
     skip_cpu_fallback = req.force_gpu
+    
     if IS_WINDOWS:
         # Windows batch script
         script_path = os.path.join(job_dir, "run_lora.bat")
@@ -331,6 +332,7 @@ REM 3. Run the training script
         
         # Add fallback mechanisms if safe training is enabled
         if use_safe_training:
+            # First attempt script section
             script_content += f"""
 echo Attempt 1: Running with normal settings...
 python "{train_py_path}"
@@ -389,12 +391,21 @@ args = [
 sys.exit(subprocess.call(args))
 "
   if %errorlevel% neq 0 (
-    echo Second attempt failed, trying with CPU...
-    {f'''
+    echo Second attempt failed
+"""
+            
+            # Conditional third attempt section based on force_gpu
+            if skip_cpu_fallback:
+                script_content += """
     echo GPU training failed and CPU fallback is disabled (force_gpu=true)
     echo Training failed - please check GPU/CUDA compatibility or enable CPU fallback
     exit /b 1
-    ''' if skip_cpu_fallback else '''
+  )
+)
+"""
+            else:
+                script_content += """
+    echo Trying with CPU...
     SET PYTORCH_CUDA_ALLOC_CONF=
     SET CUDA_LAUNCH_BLOCKING=
     SET PYTORCH_NO_CUDA_MEMORY_CACHING=
@@ -453,7 +464,6 @@ sys.exit(subprocess.call(args))
       echo All training attempts failed.
       exit /b 1
     )
-    ''')}
   )
 )
 """
@@ -543,24 +553,25 @@ echo "Output directory: {job_dir}/output"
         
         # Add fallback mechanisms if safe training is enabled
         if use_safe_training:
+            # First attempt: Normal settings
             script_content += f"""
 # First try: Run with normal settings
 echo "Attempt 1: Running with normal settings..."
-accelerate launch --mixed_precision=fp16 train_network.py \
-  --pretrained_model_name_or_path="{req.pretrained_model}" \
-  --train_data_dir="{extracted_folder}" \
-  --output_dir="{job_dir}/output" \
-  --network_module=networks.lora \
-  --learning_rate={req.learning_rate} \
-  --max_train_steps={req.max_train_steps} \
-  --resolution={req.resolution} \
-  --train_batch_size={req.train_batch_size} \
-  --network_alpha={req.network_alpha} \
-  --mixed_precision={req.mixed_precision} \
-  --save_model_as=safetensors \
-  --cache_latents \
-  --optimizer_type=AdamW \
-  --xformers \
+accelerate launch --mixed_precision=fp16 train_network.py \\
+  --pretrained_model_name_or_path="{req.pretrained_model}" \\
+  --train_data_dir="{extracted_folder}" \\
+  --output_dir="{job_dir}/output" \\
+  --network_module=networks.lora \\
+  --learning_rate={req.learning_rate} \\
+  --max_train_steps={req.max_train_steps} \\
+  --resolution={req.resolution} \\
+  --train_batch_size={req.train_batch_size} \\
+  --network_alpha={req.network_alpha} \\
+  --mixed_precision={req.mixed_precision} \\
+  --save_model_as=safetensors \\
+  --cache_latents \\
+  --optimizer_type=AdamW \\
+  --xformers \\
   --bucket_no_upscale
 
 if [ $? -ne 0 ]; then
@@ -592,32 +603,41 @@ tpu_use_sudo: false
 use_cpu: false
 EOF
   echo "Attempt 2: Running with cuDNN disabled..."
-  accelerate launch --config_file ~/.cache/huggingface/accelerate/no_cudnn_config.yaml \
-    train_network.py \
-    --pretrained_model_name_or_path="{req.pretrained_model}" \
-    --train_data_dir="{extracted_folder}" \
-    --output_dir="{job_dir}/output" \
-    --network_module=networks.lora \
-    --learning_rate={req.learning_rate} \
-    --max_train_steps={req.max_train_steps} \
-    --resolution={req.resolution} \
-    --train_batch_size={req.train_batch_size} \
-    --network_alpha={req.network_alpha} \
-    --mixed_precision={req.mixed_precision} \
-    --save_model_as=safetensors \
-    --cache_latents \
-    --optimizer_type=AdamW \
-    --xformers \
+  accelerate launch --config_file ~/.cache/huggingface/accelerate/no_cudnn_config.yaml \\
+    train_network.py \\
+    --pretrained_model_name_or_path="{req.pretrained_model}" \\
+    --train_data_dir="{extracted_folder}" \\
+    --output_dir="{job_dir}/output" \\
+    --network_module=networks.lora \\
+    --learning_rate={req.learning_rate} \\
+    --max_train_steps={req.max_train_steps} \\
+    --resolution={req.resolution} \\
+    --train_batch_size={req.train_batch_size} \\
+    --network_alpha={req.network_alpha} \\
+    --mixed_precision={req.mixed_precision} \\
+    --save_model_as=safetensors \\
+    --cache_latents \\
+    --optimizer_type=AdamW \\
+    --xformers \\
     --bucket_no_upscale
   
   if [ $? -ne 0 ]; then
-    echo "Second attempt failed, trying with CPU..."
-    # Third try: Use CPU
-    {f'''
+    echo "Second attempt failed"
+"""
+            
+            # Conditional third attempt based on force_gpu
+            if skip_cpu_fallback:
+                script_content += """
     echo "❌ GPU training failed and CPU fallback is disabled (force_gpu=true)"
     echo "Training failed - please check GPU/CUDA compatibility or enable CPU fallback"
     exit 1
-    ''' if skip_cpu_fallback else '''
+  fi
+fi
+"""
+            else:
+                script_content += """
+    echo "Trying with CPU..."
+    # Third try: Use CPU
     unset PYTORCH_CUDA_ALLOC_CONF
     unset CUDA_LAUNCH_BLOCKING
     unset PYTORCH_NO_CUDA_MEMORY_CACHING
@@ -665,7 +685,6 @@ EOF
       echo "All training attempts failed."
       exit 1
     fi
-    '''}
   fi
 fi
 """
