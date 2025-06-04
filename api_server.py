@@ -714,12 +714,12 @@ fi
 """
         
         # Continue with the S3 upload code (existing code)
-        script_content += """
+        script_content += f"""
 echo "Training successful!"
 
 # ─────────────────────────────────────────────────────────────────────────────
 # 4. Find the safetensors file
-OUTPUT_DIR="${job_dir}/output"
+OUTPUT_DIR="{job_dir}/output"
 MODEL_FILE=$(ls "$OUTPUT_DIR"/*.safetensors 2>/dev/null | head -n 1)
 
 if [ -z "$MODEL_FILE" ]; then
