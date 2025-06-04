@@ -46,6 +46,10 @@ class LoRATrainRequest(BaseModel):
 USER_HOME = os.path.expanduser("~")
 TRAIN_BASE = os.path.join(USER_HOME, "lora_data/train_images")
 JOBS_ROOT = os.path.join(USER_HOME, "lora_data/lora_jobs")
+# Path to the Python virtual environment
+VENV_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "venv")
+# Path to the training scripts
+TRAINING_SCRIPTS_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "scripts/stable")
 
 os.makedirs(TRAIN_BASE, exist_ok=True)
 os.makedirs(JOBS_ROOT, exist_ok=True)
@@ -145,21 +149,35 @@ args = [
 # This function will be called to run the actual training
 def main():
     try:
-        # Import and run the accelerate launch command
-        from accelerate.commands.launch import main as accelerate_main
-        from accelerate.commands.config import main as accelerate_config
+        # Create accelerate config directory if it doesn't exist
+        os.makedirs(os.path.expanduser("~/.cache/huggingface/accelerate"), exist_ok=True)
         
-        # Configure accelerate if not already configured
-        try:
-            accelerate_config(["default", "--mixed_precision=fp16"])
-        except:
-            pass
-            
-        # Add the main training script and its arguments to sys.argv
-        sys.argv = ["accelerate", "launch", "-m", "train_network", "--network_module=lora"] + args
-        accelerate_main()
+        # Create default config if needed
+        config_path = os.path.expanduser("~/.cache/huggingface/accelerate/default_config.yaml")
+        if not os.path.exists(config_path):
+            with open(config_path, "w") as f:
+                f.write('''compute_environment: LOCAL_MACHINE
+distributed_type: 'NO'
+downcast_bf16: 'no'
+gpu_ids: all
+machine_rank: 0
+main_training_function: main
+mixed_precision: fp16
+num_machines: 1
+num_processes: 1
+rdzv_backend: static
+same_network: true
+tpu_env: []
+tpu_use_cluster: false
+tpu_use_sudo: false
+use_cpu: false''')
         
-        return 0
+        # Run the training directly
+        print("Starting training with accelerate...")
+        command = ["accelerate", "launch", "--mixed_precision=fp16", "train_network.py"] + args
+        result = subprocess.run(command, check=True)
+        return result.returncode
+        
     except Exception as e:
         print(f"Training failed: {{e}}")
         return 1
@@ -184,7 +202,7 @@ def generate_training_script(job_dir, dst_train_sh, extracted_folder, req):
     if IS_WINDOWS:
         # Windows batch script
         script_path = os.path.join(job_dir, "run_lora.bat")
-        venv_activate = os.path.abspath(os.path.join("venv", "Scripts", "activate.bat"))
+        venv_activate = os.path.abspath(os.path.join(VENV_PATH, "Scripts", "activate.bat"))
         
         # For Windows, create a Python script to handle the training
         train_py_path = create_windows_training_script(job_dir, extracted_folder, req)
@@ -286,12 +304,17 @@ exit /b 0
     else:
         # Unix/Linux bash script
         script_path = os.path.join(job_dir, "run_lora.sh")
-        venv_activate = os.path.abspath("venv/bin/activate")
+        # Use absolute path to virtual environment
+        venv_activate = os.path.join(VENV_PATH, "bin/activate")
         
         script_content = f"""#!/usr/bin/env bash
 # ─────────────────────────────────────────────────────────────────────────────
 # 1. Activate the Python venv
-source "{venv_activate}"
+if [ -f "{venv_activate}" ]; then
+    source "{venv_activate}"
+else
+    echo "Warning: Virtual environment not found at {venv_activate}"
+fi
 cd "{job_dir}"
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -315,8 +338,36 @@ export FOLDER_NAME
 export LORA_NAME
 
 # ─────────────────────────────────────────────────────────────────────────────
-# 3. Run LoRA training
-bash "{dst_train_sh}" \\
+# 3. Run LoRA training via accelerate directly
+# Create temp accelerate config if needed
+mkdir -p ~/.cache/huggingface/accelerate
+if [ ! -f ~/.cache/huggingface/accelerate/default_config.yaml ]; then
+    echo "Creating default accelerate config"
+    echo "compute_environment: LOCAL_MACHINE
+distributed_type: 'NO'
+downcast_bf16: 'no'
+gpu_ids: all
+machine_rank: 0
+main_training_function: main
+mixed_precision: fp16
+num_machines: 1
+num_processes: 1
+rdzv_backend: static
+same_network: true
+tpu_env: []
+tpu_use_cluster: false
+tpu_use_sudo: false
+use_cpu: false" > ~/.cache/huggingface/accelerate/default_config.yaml
+fi
+
+# Set additional environment variables
+export HF_HOME=huggingface
+export PYTHONPATH=$(pwd)
+
+# Run accelerate directly with parameters
+accelerate launch \\
+  --mixed_precision={req.mixed_precision} \\
+  train_network.py \\
   --pretrained_model_name_or_path="$PRETRAINED_MODEL" \\
   --train_data_dir="$TRAIN_DATA_DIR" \\
   --output_dir="$OUTPUT_DIR" \\
@@ -327,6 +378,12 @@ bash "{dst_train_sh}" \\
   --train_batch_size="$TRAIN_BATCH_SIZE" \\
   --network_alpha="$NETWORK_ALPHA" \\
   --mixed_precision="$MIXED_PRECISION"
+
+# Check if training was successful
+if [ $? -ne 0 ]; then
+  echo "ERROR: Training failed" >&2
+  exit 1
+fi
 
 # ─────────────────────────────────────────────────────────────────────────────
 # 4. Locate the .safetensors file

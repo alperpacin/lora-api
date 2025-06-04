@@ -43,7 +43,6 @@ open-clip-torch==2.20.0
 lycoris-lora==2.1.0.post3
 dadaptation==3.1
 fastapi
-uvicorn[standard]
-pydantic
+uvicorn[standard]pydantic
 requests
 boto3
