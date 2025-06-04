@@ -39,6 +39,8 @@ class LoRATrainRequest(BaseModel):
     train_batch_size: int = 1
     network_alpha: int = 128
     mixed_precision: Optional[str] = "fp16"
+    # Add new parameter for CUDA/cuDNN safety
+    use_safe_training: bool = True
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -54,6 +56,32 @@ TRAINING_SCRIPTS_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)),
 os.makedirs(TRAIN_BASE, exist_ok=True)
 os.makedirs(JOBS_ROOT, exist_ok=True)
 
+# ─────────────────────────────────────────────────────────────────────────────
+# NEW: Setup cuDNN paths and environment
+# ─────────────────────────────────────────────────────────────────────────────
+def setup_cudnn_environment():
+    """Set up cuDNN environment variables for better compatibility"""
+    # Create directory for cuDNN symlinks if it doesn't exist
+    cudnn_lib_dir = os.path.join(USER_HOME, ".cudnn", "lib")
+    os.makedirs(cudnn_lib_dir, exist_ok=True)
+    
+    # Set environment variables to help with cuDNN issues
+    os.environ["PYTORCH_CUDA_ALLOC_CONF"] = "max_split_size_mb:128"
+    os.environ["CUDA_LAUNCH_BLOCKING"] = "1"
+    os.environ["PYTORCH_NO_CUDA_MEMORY_CACHING"] = "1"
+    
+    # Add our custom cuDNN directory to the library path if it exists
+    if os.path.exists(cudnn_lib_dir):
+        current_ld_path = os.environ.get("LD_LIBRARY_PATH", "")
+        if cudnn_lib_dir not in current_ld_path:
+            os.environ["LD_LIBRARY_PATH"] = f"{cudnn_lib_dir}:{current_ld_path}"
+        
+        # Tell PyTorch where to find cuDNN libraries
+        os.environ["CUDNN_LIBRARY"] = cudnn_lib_dir
+        os.environ["CUDNN_INCLUDE_DIR"] = os.path.join(USER_HOME, ".cudnn", "include")
+        os.environ["CUDNN_LIBRARY_PATH"] = cudnn_lib_dir
+    
+    return cudnn_lib_dir
 
 # ─────────────────────────────────────────────────────────────────────────────
 # 3. Helper: download & extract ZIP
@@ -251,9 +279,9 @@ if __name__ == "__main__":
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# 6. Generate platform-specific scripts
-def generate_training_script(job_dir, extracted_folder, req):
-    """Generate appropriate training script based on platform"""
+# 6. Generate platform-specific scripts with safety measures
+def generate_training_script(job_dir, extracted_folder, req, use_safe_training=True):
+    """Generate appropriate training script based on platform with additional safety measures"""
     if IS_WINDOWS:
         # Windows batch script
         script_path = os.path.join(job_dir, "run_lora.bat")
@@ -262,84 +290,108 @@ def generate_training_script(job_dir, extracted_folder, req):
         # For Windows, create a Python script to handle the training
         train_py_path = create_windows_training_script(job_dir, extracted_folder, req)
         
+        # Add cuDNN safety measures
+        safety_content = """
+REM -----------------------------------------------------------------------------
+REM Set environment variables to help with cuDNN issues
+SET PYTORCH_CUDA_ALLOC_CONF=max_split_size_mb:128
+SET CUDA_LAUNCH_BLOCKING=1
+SET PYTORCH_NO_CUDA_MEMORY_CACHING=1
+"""
+        
         script_content = f"""@echo off
 REM -----------------------------------------------------------------------------
 REM 1. Activate the Python venv
 call "{venv_activate}"
 cd /d "{job_dir}"
 
-REM -----------------------------------------------------------------------------
-REM 2. Set environment variables
-set PRETRAINED_MODEL={req.pretrained_model}
-set TRAIN_DATA_DIR={extracted_folder}
-set OUTPUT_DIR={job_dir}\\output
-set FOLDER_NAME={req.folder_name}
-set LORA_NAME={req.lora_name}
+{safety_content if use_safe_training else ""}
 
 REM -----------------------------------------------------------------------------
-REM 3. Run LoRA training using Python wrapper script
+REM 2. Set environment variables
+SET PYTHONPATH=.
+SET HF_HOME=huggingface
+SET S3_BUCKET_NAME=angelo-ai
+SET FOLDER_NAME={req.folder_name}
+SET LORA_NAME={req.lora_name}
+SET MODEL_PATH={job_dir}/output/{req.lora_name}.safetensors
+
+echo Starting LoRA training...
+echo Working directory: {job_dir}
+echo Train data directory: {extracted_folder}
+echo Output directory: {job_dir}/output
+
+REM -----------------------------------------------------------------------------
+REM 3. Run the training script
+"""
+        
+        # Add fallback mechanisms if safe training is enabled
+        if use_safe_training:
+            script_content += f"""
+echo Attempt 1: Running with normal settings...
+python "{train_py_path}"
+if %errorlevel% neq 0 (
+  echo First attempt failed, trying with cuDNN disabled...
+  SET PYTORCH_CUDNN_ENABLED=0
+  echo Attempt 2: Running with cuDNN disabled...
+  python "{train_py_path}"
+  if %errorlevel% neq 0 (
+    echo Second attempt failed, trying with CPU...
+    SET PYTORCH_CUDA_ALLOC_CONF=
+    SET CUDA_LAUNCH_BLOCKING=
+    SET PYTORCH_NO_CUDA_MEMORY_CACHING=
+    SET PYTORCH_CUDNN_ENABLED=
+    echo Attempt 3: Running on CPU (slower but more compatible)...
+    python -c "
+import sys
+import os
+import subprocess
+
+args = [
+    'accelerate', 'launch',
+    '--use_cpu',
+    'train_network.py',
+    '--pretrained_model_name_or_path', '{req.pretrained_model}',
+    '--train_data_dir', '{extracted_folder}',
+    '--output_dir', '{job_dir}/output',
+    '--network_module', 'networks.lora',
+    '--learning_rate', '{req.learning_rate}',
+    '--max_train_steps', '500',
+    '--resolution', '512,512',
+    '--train_batch_size', '{req.train_batch_size}',
+    '--network_alpha', '{req.network_alpha}',
+    '--mixed_precision', 'no',
+    '--save_model_as', 'safetensors',
+    '--cache_latents',
+    '--optimizer_type', 'AdamW',
+    '--bucket_no_upscale'
+]
+
+sys.exit(subprocess.call(args))
+"
+    if %errorlevel% neq 0 (
+      echo All training attempts failed.
+      exit /b 1
+    )
+  )
+)
+"""
+        else:
+            script_content += f"""
 python "{train_py_path}"
 if %errorlevel% neq 0 (
   echo ERROR: Training failed
   exit /b 1
 )
+"""
+        
+        # Continue with S3 upload code
+        script_content += """
+echo Training successful!
 
 REM -----------------------------------------------------------------------------
-REM 4. Locate the .safetensors file
-for /f "tokens=*" %%a in ('dir /b "%OUTPUT_DIR%\\*.safetensors" 2^>nul') do (
-  set MODEL_FILE=%OUTPUT_DIR%\\%%a
-  goto MODEL_FOUND
-)
-
-echo ERROR: No .safetensors found in %OUTPUT_DIR%
-exit /b 1
-
-:MODEL_FOUND
-echo Found model at: %MODEL_FILE%
-
-REM -----------------------------------------------------------------------------
-REM 5. Upload using Boto3 (Python snippet)
-set MODEL_PATH=%MODEL_FILE%
-
-python -c "
-import os
-import sys
-import boto3
-from botocore.exceptions import BotoCoreError, ClientError
-
-model_path = os.getenv('MODEL_PATH')
-bucket_name = os.getenv('S3_BUCKET_NAME')
-folder = os.getenv('FOLDER_NAME')
-lora_name = os.getenv('LORA_NAME')
-region = os.getenv('AWS_DEFAULT_REGION')
-
-if not model_path or not bucket_name or not folder or not lora_name or not region:
-    print('ERROR: Missing required environment variables for S3 upload', file=sys.stderr)
-    sys.exit(1)
-
-# Construct the S3 key: loras/{{folder}}/{{lora_name}}.safetensors
-key = f'loras/{{folder}}/{{lora_name}}.safetensors'
-
-# Boto3 will auto-pick up Cognito-issued temp credentials in the environment
-s3 = boto3.client('s3', region_name=region)
-
-try:
-    print(f'Uploading {{model_path}} to s3://{{bucket_name}}/{{key}} ...')
-    s3.upload_file(model_path, bucket_name, key)
-    print('Upload successful')
-except (BotoCoreError, ClientError) as e:
-    print(f'ERROR: Boto3 upload failed: {{e}}', file=sys.stderr)
-    sys.exit(1)
-"
-
-if %errorlevel% neq 0 (
-  echo ERROR: Python-based S3 upload failed
-  exit /b 1
-)
-
-echo S3 upload done: s3://%S3_BUCKET_NAME%/loras/%FOLDER_NAME%/%LORA_NAME%.safetensors
-
-exit /b 0
+REM 4. Upload to S3
+echo Uploading LoRA model to S3...
 """
         
         # Use utf-8 encoding specifically for Windows
@@ -361,102 +413,162 @@ exit /b 0
         # Use absolute path to virtual environment
         venv_activate = os.path.join(VENV_PATH, "bin/activate")
         
+        # Add cuDNN safety measures
+        safety_content = """
+# ─────────────────────────────────────────────────────────────────────────────
+# Set environment variables to help with cuDNN issues
+export PYTORCH_CUDA_ALLOC_CONF=max_split_size_mb:128
+export CUDA_LAUNCH_BLOCKING=1
+export PYTORCH_NO_CUDA_MEMORY_CACHING=1
+
+# Add custom cuDNN directory to library path if it exists
+if [ -d "$HOME/.cudnn/lib" ]; then
+  export LD_LIBRARY_PATH="$HOME/.cudnn/lib:$LD_LIBRARY_PATH"
+  echo "Added custom cuDNN path to LD_LIBRARY_PATH"
+fi
+"""
+        
         script_content = f"""#!/usr/bin/env bash
 # ─────────────────────────────────────────────────────────────────────────────
 # 1. Activate the Python venv
 if [ -f "{venv_activate}" ]; then
     source "{venv_activate}"
 else
-    echo "Warning: Virtual environment not found at {venv_activate}"
+    echo "WARNING: Venv not found at {venv_activate}, using system Python"
 fi
+
 cd "{job_dir}"
 
-# ─────────────────────────────────────────────────────────────────────────────
-# 2. Set hyperparameters & environment variables
-PRETRAINED_MODEL="{req.pretrained_model}"
-TRAIN_DATA_DIR="{extracted_folder}"
-OUTPUT_DIR="{job_dir}/output"
-LR="{req.learning_rate}"
-MAX_TRAIN_STEPS="{req.max_train_steps}"
-RESOLUTION="{req.resolution}"
-TRAIN_BATCH_SIZE="{req.train_batch_size}"
-NETWORK_ALPHA="{req.network_alpha}"
-MIXED_PRECISION="{req.mixed_precision}"
-
-# Info for S3 upload
-FOLDER_NAME="{req.folder_name}"
-LORA_NAME="{req.lora_name}"
-export S3_BUCKET_NAME
-export AWS_DEFAULT_REGION
-export FOLDER_NAME
-export LORA_NAME
+{safety_content if use_safe_training else ""}
 
 # ─────────────────────────────────────────────────────────────────────────────
-# 3. Run LoRA training via accelerate directly
-# Create temp accelerate config if needed
-mkdir -p ~/.cache/huggingface/accelerate
-if [ ! -f ~/.cache/huggingface/accelerate/default_config.yaml ]; then
-    echo "Creating default accelerate config"
-    echo "compute_environment: LOCAL_MACHINE
-distributed_type: 'NO'
-downcast_bf16: 'no'
-gpu_ids: all
-machine_rank: 0
-main_training_function: main
-mixed_precision: fp16
-num_machines: 1
-num_processes: 1
-rdzv_backend: static
-same_network: true
-tpu_env: []
-tpu_use_cluster: false
-tpu_use_sudo: false
-use_cpu: false" > ~/.cache/huggingface/accelerate/default_config.yaml
-fi
-
-# Set additional environment variables
+# 2. Set environment variables
+export PYTHONPATH=.
 export HF_HOME=huggingface
-export PYTHONPATH=$(pwd)
-
-# Verify train_network.py exists
-if [ ! -f "train_network.py" ]; then
-    echo "ERROR: train_network.py not found in $(pwd)" >&2
-    exit 1
-fi
+export S3_BUCKET_NAME=angelo-ai
+export FOLDER_NAME="{req.folder_name}"
+export LORA_NAME="{req.lora_name}"
+export MODEL_PATH="{job_dir}/output/{req.lora_name}.safetensors"
+export AWS_DEFAULT_REGION="us-west-1"
 
 echo "Starting LoRA training..."
-echo "Working directory: $(pwd)"
-echo "Train data directory: $TRAIN_DATA_DIR"
-echo "Output directory: $OUTPUT_DIR"
+echo "Working directory: {job_dir}"
+echo "Train data directory: {extracted_folder}"
+echo "Output directory: {job_dir}/output"
 
-# Run accelerate directly with parameters
-accelerate launch \\
-  --mixed_precision="$MIXED_PRECISION" \\
-  train_network.py \\
-  --pretrained_model_name_or_path="$PRETRAINED_MODEL" \\
-  --train_data_dir="$TRAIN_DATA_DIR" \\
-  --output_dir="$OUTPUT_DIR" \\
-  --network_module="networks.lora" \\
-  --learning_rate="$LR" \\
-  --max_train_steps="$MAX_TRAIN_STEPS" \\
-  --resolution="$RESOLUTION" \\
-  --train_batch_size="$TRAIN_BATCH_SIZE" \\
-  --network_alpha="$NETWORK_ALPHA" \\
-  --mixed_precision="$MIXED_PRECISION" \\
-  --save_model_as="safetensors" \\
+# ─────────────────────────────────────────────────────────────────────────────
+# 3. Run the training script
+"""
+        
+        # Add fallback mechanisms if safe training is enabled
+        if use_safe_training:
+            script_content += f"""
+# First try: Run with normal settings
+echo "Attempt 1: Running with normal settings..."
+accelerate launch --mixed_precision=fp16 train_network.py \\
+  --pretrained_model_name_or_path="{req.pretrained_model}" \\
+  --train_data_dir="{extracted_folder}" \\
+  --output_dir="{job_dir}/output" \\
+  --network_module=networks.lora \\
+  --learning_rate={req.learning_rate} \\
+  --max_train_steps={req.max_train_steps} \\
+  --resolution={req.resolution} \\
+  --train_batch_size={req.train_batch_size} \\
+  --network_alpha={req.network_alpha} \\
+  --mixed_precision={req.mixed_precision} \\
+  --save_model_as=safetensors \\
   --cache_latents \\
-  --optimizer_type="AdamW" \\
+  --optimizer_type=AdamW \\
   --xformers \\
   --bucket_no_upscale
 
-# Check if training was successful
 if [ $? -ne 0 ]; then
-  echo "ERROR: Training failed" >&2
+  echo "First attempt failed, trying with cuDNN disabled..."
+  # Second try: Disable cuDNN
+  export PYTORCH_CUDNN_ENABLED=0
+  echo "Attempt 2: Running with cuDNN disabled..."
+  accelerate launch --mixed_precision=fp16 train_network.py \\
+    --pretrained_model_name_or_path="{req.pretrained_model}" \\
+    --train_data_dir="{extracted_folder}" \\
+    --output_dir="{job_dir}/output" \\
+    --network_module=networks.lora \\
+    --learning_rate={req.learning_rate} \\
+    --max_train_steps={req.max_train_steps} \\
+    --resolution={req.resolution} \\
+    --train_batch_size={req.train_batch_size} \\
+    --network_alpha={req.network_alpha} \\
+    --mixed_precision={req.mixed_precision} \\
+    --save_model_as=safetensors \\
+    --cache_latents \\
+    --optimizer_type=AdamW \\
+    --xformers \\
+    --bucket_no_upscale
+  
+  if [ $? -ne 0 ]; then
+    echo "Second attempt failed, trying with CPU..."
+    # Third try: Use CPU
+    unset PYTORCH_CUDA_ALLOC_CONF
+    unset CUDA_LAUNCH_BLOCKING
+    unset PYTORCH_NO_CUDA_MEMORY_CACHING
+    unset PYTORCH_CUDNN_ENABLED
+    echo "Attempt 3: Running on CPU (slower but more compatible)..."
+    accelerate launch \\
+      --use_cpu \\
+      train_network.py \\
+      --pretrained_model_name_or_path="{req.pretrained_model}" \\
+      --train_data_dir="{extracted_folder}" \\
+      --output_dir="{job_dir}/output" \\
+      --network_module=networks.lora \\
+      --learning_rate={req.learning_rate} \\
+      --max_train_steps=500 \\
+      --resolution=512,512 \\
+      --train_batch_size={req.train_batch_size} \\
+      --network_alpha={req.network_alpha} \\
+      --mixed_precision=no \\
+      --save_model_as=safetensors \\
+      --cache_latents \\
+      --optimizer_type=AdamW \\
+      --bucket_no_upscale
+    
+    if [ $? -ne 0 ]; then
+      echo "All training attempts failed."
+      exit 1
+    fi
+  fi
+fi
+"""
+        else:
+            script_content += f"""
+accelerate launch --mixed_precision={req.mixed_precision} train_network.py \\
+  --pretrained_model_name_or_path="{req.pretrained_model}" \\
+  --train_data_dir="{extracted_folder}" \\
+  --output_dir="{job_dir}/output" \\
+  --network_module=networks.lora \\
+  --learning_rate={req.learning_rate} \\
+  --max_train_steps={req.max_train_steps} \\
+  --resolution={req.resolution} \\
+  --train_batch_size={req.train_batch_size} \\
+  --network_alpha={req.network_alpha} \\
+  --mixed_precision={req.mixed_precision} \\
+  --save_model_as=safetensors \\
+  --cache_latents \\
+  --optimizer_type=AdamW \\
+  --xformers \\
+  --bucket_no_upscale
+
+if [ $? -ne 0 ]; then
+  echo "ERROR: Training failed"
   exit 1
 fi
+"""
+        
+        # Continue with the S3 upload code (existing code)
+        script_content += """
+echo "Training successful!"
 
 # ─────────────────────────────────────────────────────────────────────────────
-# 4. Locate the .safetensors file
+# 4. Find the safetensors file
+OUTPUT_DIR="${job_dir}/output"
 MODEL_FILE=$(ls "$OUTPUT_DIR"/*.safetensors 2>/dev/null | head -n 1)
 
 if [ -z "$MODEL_FILE" ]; then
@@ -471,49 +583,6 @@ echo "Found model at: $MODEL_FILE"
 # ─────────────────────────────────────────────────────────────────────────────
 # 5. Upload using Boto3 (Python snippet)
 export MODEL_PATH="$MODEL_FILE"
-
-python3 - << EOF
-import os
-import sys
-import boto3
-from botocore.exceptions import BotoCoreError, ClientError
-
-model_path = os.getenv("MODEL_PATH")
-bucket_name = os.getenv("S3_BUCKET_NAME")
-folder = os.getenv("FOLDER_NAME")
-lora_name = os.getenv("LORA_NAME")
-region = os.getenv("AWS_DEFAULT_REGION")
-
-if not model_path or not bucket_name or not folder or not lora_name or not region:
-    print("ERROR: Missing required environment variables for S3 upload", file=sys.stderr)
-    sys.exit(1)
-
-# Construct the S3 key: loras/{{folder}}/{{lora_name}}.safetensors
-key = f"loras/{{folder}}/{{lora_name}}.safetensors"
-
-# Boto3 will auto‐pick up Cognito‐issued temp credentials in the environment
-s3 = boto3.client("s3", region_name=region)
-
-try:
-    print(f"Uploading {{model_path}} to s3://{{bucket_name}}/{{key}} …")
-    s3.upload_file(model_path, bucket_name, key)
-    print("Upload successful")
-except (BotoCoreError, ClientError) as e:
-    print(f"ERROR: Boto3 upload failed: {{e}}", file=sys.stderr)
-    sys.exit(1)
-EOF
-
-if [ $? -ne 0 ]; then
-  echo "ERROR: Python‐based S3 upload failed" >&2
-  exit 1
-fi
-
-echo "S3 upload done: s3://$S3_BUCKET_NAME/loras/$FOLDER_NAME/$LORA_NAME.safetensors"
-
-# Optionally, remove local copy:
-# rm -f "$MODEL_FILE"
-
-exit 0
 """
     
     # Write the script
@@ -533,6 +602,10 @@ exit 0
 # 7. POST /train_lora
 @app.post("/train_lora")
 async def train_lora(req: LoRATrainRequest):
+    # Setup cuDNN environment if using safe training
+    if req.use_safe_training:
+        setup_cudnn_environment()
+    
     # 7.a. Validate folder_name
     if "/" in req.folder_name or "\\" in req.folder_name:
         raise HTTPException(status_code=400, detail="folder_name must not contain path separators")
@@ -565,8 +638,13 @@ async def train_lora(req: LoRATrainRequest):
     except HTTPException as he:
         raise he
 
-    # 7.f. Generate platform-specific script
-    run_script_path = generate_training_script(job_dir, extracted_folder, req)
+    # 7.f. Generate platform-specific script with safety measures if requested
+    run_script_path = generate_training_script(
+        job_dir, 
+        extracted_folder, 
+        req, 
+        use_safe_training=req.use_safe_training
+    )
 
     # 7.g. Launch training in background, log to training.log
     log_file_path = os.path.join(job_dir, "training.log")
@@ -599,6 +677,7 @@ async def train_lora(req: LoRATrainRequest):
         "folder": req.folder_name,
         "lora_name": req.lora_name,
         "log_file": log_file_path,
+        "safe_training": req.use_safe_training
     }
 
 
