@@ -65,6 +65,26 @@ def parse_args():
     parser.add_argument("--mixed_precision", type=str, default="fp16",
                         choices=["no", "fp16", "bf16"],
                         help="Mixed precision training")
+
+    # ------------------------------------------------------------------
+    # after the existing parser.add_argument(...) block
+    # just copy-paste these; they don’t have to be used later
+    parser.add_argument("--output_name",        type=str, default="lora")
+    parser.add_argument("--save_model_as",      type=str, default="safetensors")
+    parser.add_argument("--save_every_n_epochs",type=int, default=1)
+    parser.add_argument("--cache_latents",      action="store_true")
+    parser.add_argument("--optimizer_type",     type=str, default="AdamW8bit")
+    parser.add_argument("--xformers",           action="store_true")
+    parser.add_argument("--bucket_no_upscale",  action="store_true")
+    parser.add_argument("--gradient_accumulation_steps", type=int, default=1)
+    parser.add_argument("--lr_scheduler",       type=str, default="cosine")
+    parser.add_argument("--lr_warmup_steps",    type=int, default=0)
+    parser.add_argument("--caption_extension",  type=str, default=".txt")
+    parser.add_argument("--clip_skip",          type=int, default=1)
+    parser.add_argument("--save_every_n_steps", type=int, default=None)
+    parser.add_argument("--no_half_vae",        action="store_true")
+    parser.add_argument("--sdxl",               action="store_true")
+    # ------------------------------------------------------------------
     
     args = parser.parse_args()
     
